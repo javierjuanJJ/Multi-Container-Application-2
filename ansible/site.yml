@@ -5,14 +5,17 @@
 
   vars:
     admin_user: admin
+    # nginx NO se instala en el host: el reverse proxy del bonus corre como
+    # contenedor y publica el 80/443 (ver docker-compose.prod.yml). Instalarlo
+    # aqui competiria por el puerto 80.
     packages:
-      - nginx
       - ufw
       - curl
+      - ca-certificates
+      - gnupg
       - unattended-upgrades
       - chrony
     sshd_config_dropin: /etc/ssh/sshd_config.d/99-hardening.conf
-    index_page_path: /var/www/html/index.html
 
   tasks:
     - name: Actualizar la cache de paquetes
@@ -76,6 +79,8 @@
         mode: "0644"
       notify: Restart sshd
 
+    # El Cloud Firewall de DigitalOcean ya filtra el trafico; ufw es la segunda capa.
+    # El 80/443 lo publica el reverse proxy en un contenedor.
     - name: Permitir SSH, HTTP y HTTPS en el firewall
       community.general.ufw:
         rule: allow
@@ -88,34 +93,7 @@
       community.general.ufw:
         state: enabled
 
-    - name: Desplegar la pagina por defecto
-      ansible.builtin.copy:
-        dest: "{{ index_page_path }}"
-        content: |
-          <!doctype html>
-          <html lang="es">
-            <head><meta charset="utf-8"><title>IaC en DigitalOcean</title></head>
-            <body>
-              <h1>Droplet desplegado con Terraform y configurado con Ansible</h1>
-              <p>Host: {{ inventory_hostname }} | Ansible user: {{ ansible_user }}</p>
-            </body>
-          </html>
-        owner: root
-        group: root
-        mode: "0644"
-      notify: Restart nginx
-
-    - name: Verificar la sintaxis de la configuracion de nginx
-      ansible.builtin.command: nginx -t
-      changed_when: false
-
   handlers:
-    - name: Restart nginx
-      ansible.builtin.service:
-        name: nginx
-        state: restarted
-        enabled: true
-
     - name: Restart sshd
       ansible.builtin.service:
         name: sshd

@@ -37,3 +37,17 @@ output "ansible_inventory_host" {
   description = "Linea de inventario para el Droplet, lista para pegar en inventory.ini."
   value       = "web-1 ansible_host=${digitalocean_droplet.web.ipv4_address} ansible_user=root"
 }
+
+output "firewall_id" {
+  description = "ID del Cloud Firewall que protege el Droplet."
+  value       = digitalocean_firewall.web.id
+}
+
+output "domain_url" {
+  description = "URL publica del bonus. Sale vacio si no se definio domain_name."
+  value = var.domain_name == null ? null : format(
+    "http://%s%s",
+    var.domain_record_name == "@" ? var.domain_name : "${var.domain_record_name}.${var.domain_name}",
+    var.domain_record_type == "CNAME" ? "" : "",
+  )
+}

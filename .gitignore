@@ -12,8 +12,20 @@ floci/data/
 .idea/
 opencode.json
 
-# Dependencias y artefactos de build de la app Node.js
-app/node_modules/
-app/dist/
-app/npm-debug.log*
-app/.npm/
+# Dependencias de la API Node.js
+api/node_modules/
+api/dist/
+api/npm-debug.log*
+api/.npm/
+
+# Variables de entorno: nunca suben credenciales al repositorio
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# Ficheros temporales del pipeline de despliegue
+.staging/
+
+# Certificados del reverse proxy
+nginx/certs/

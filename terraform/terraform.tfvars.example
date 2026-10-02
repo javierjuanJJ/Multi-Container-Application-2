@@ -1,9 +1,18 @@
 do_token = "dop_v1_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 
-droplet_name   = "web-1"
+droplet_name   = "todos-1"
 droplet_region = "nyc3"
 droplet_size   = "s-1vcpu-1gb"
 droplet_image  = "ubuntu-24-04-x64"
 
 ssh_key_name         = "terraform-iac-lab"
 ssh_public_key_path = "~/.ssh/id_ed25519.pub"
+
+# Cloud Firewall. Deja la lista vacia para permitir SSH desde cualquier IP.
+allowed_ssh_ips = []
+open_web_ports  = true
+
+# Bonus del reverse proxy: dominio en DigitalOcean. Pon null si todavia no tienes uno.
+domain_name         = null
+domain_record_name  = "@"
+domain_record_type  = "A"

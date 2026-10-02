@@ -1,0 +1,41 @@
+---
+# Valores por defecto del rol `docker`. Se pueden sobreescribir desde el playbook:
+#   ansible-playbook todos.yml -e docker_edition=ce
+
+# Que flavour del motor se instala
+docker_edition: ce
+docker_package_prefix: docker
+docker_state: latest
+docker_branch: stable
+
+# Versiones pineadas. Sin fijar, se instala la ultima de la rama configurada.
+docker_ce_version: ""
+docker_compose_plugin_version: ""
+
+# Paquetes oficiales. `containerd.io` es el runtime que usa docker por defecto.
+docker_packages:
+  - "{{ docker_package_prefix }}-ce"
+  - "{{ docker_package_prefix }}-ce-cli"
+  - containerd.io
+  - "{{ docker_package_prefix }}-buildx-plugin"
+  - "{{ docker_package_prefix }}-compose-plugin"
+
+# Repositorio apt oficial de Docker
+docker_apt_key_url: https://download.docker.com/linux/ubuntu/gpg
+docker_apt_key_path: /etc/apt/keyrings/docker.asc
+docker_apt_repository: https://download.docker.com/linux/ubuntu
+
+# Daemon
+docker_config_path: /etc/docker/daemon.json
+docker_log_driver: json-file
+docker_log_max_size: 10m
+docker_log_max_file: "3"
+docker_live_restore: true
+
+# Usuario de despliegue que se anade al grupo docker (evita usar root para desplegar)
+docker_deploy_user: deploy
+docker_deploy_user_group: docker
+
+# Plantilla de formato de `docker version`. Las llaves van escapadas porque
+# Ansible las interpretaria como una expresion Jinja.
+docker_version_format: "{{ '{{' }}.Server.Version{{ '}}' }}"

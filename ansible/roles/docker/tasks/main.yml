@@ -1,0 +1,129 @@
+---
+# ---------------------------------------------------------------------------
+# Requisito #2 - Instalar Docker Engine + plugin de Compose en el Droplet
+# ---------------------------------------------------------------------------
+
+- name: Instalar python3-debian (requisito de deb822_repository)
+  ansible.builtin.apt:
+    name: python3-debian
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Crear el directorio de keyrings de apt
+  ansible.builtin.file:
+    path: "{{ docker_apt_key_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Descargar la clave GPG de Docker
+  ansible.builtin.get_url:
+    url: "{{ docker_apt_key_url }}"
+    dest: "{{ docker_apt_key_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: docker_gpg_key
+
+- name: Registrar el repositorio oficial de Docker
+  ansible.builtin.deb822_repository:
+    name: docker
+    description: "Docker CE"
+    types:
+      - deb
+    uris: "{{ docker_apt_repository }}"
+    suites:
+      - "{{ docker_branch }}"
+    components:
+      - stable
+    signed_by: "{{ docker_apt_key_path }}"
+    state: present
+  register: docker_repo
+  # Reintenta: si el repositorio se acaba de anadir, apt aun puede fallar por cache
+  retries: 3
+  delay: 5
+  until: docker_repo is succeeded
+  notify: Recargar systemd
+
+- name: Actualizar la cache de paquetes si cambio el repositorio
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  when: docker_repo is changed
+
+- name: Instalar Docker Engine y el plugin de Compose
+  ansible.builtin.apt:
+    name: "{{ docker_packages }}"
+    state: "{{ docker_state }}"
+  register: docker_apt_install
+  notify: Reiniciar Docker
+
+- name: Comprobar la version del motor de Docker
+  ansible.builtin.command: docker --version
+  register: docker_engine_version
+  changed_when: false
+
+- name: Comprobar la version de Docker Compose
+  ansible.builtin.command: docker compose version
+  register: docker_compose_version
+  changed_when: false
+
+- name: Mostrar las versiones instaladas
+  ansible.builtin.debug:
+    msg: "{{ docker_engine_version.stdout }} | {{ docker_compose_version.stdout }}"
+
+- name: Crear el usuario de despliegue
+  ansible.builtin.user:
+    name: "{{ docker_deploy_user }}"
+    groups: "{{ docker_deploy_user_group }}"
+    shell: /bin/bash
+    append: true
+    create_home: true
+    state: present
+
+- name: Anadir el usuario de despliegue al grupo docker
+  ansible.builtin.user:
+    name: "{{ docker_deploy_user }}"
+    groups: "{{ docker_deploy_user_group }}"
+    append: true
+    state: present
+
+# El grupo docker concede privilegios equivalentes a root: se documenta, no se oculta.
+- name: Configurar el demonio Docker
+  ansible.builtin.copy:
+    dest: "{{ docker_config_path }}"
+    content: |
+      {
+        "log-driver": "{{ docker_log_driver }}",
+        "log-opts": {
+          "max-size": "{{ docker_log_max_size }}",
+          "max-file": "{{ docker_log_max_file }}"
+        },
+        "live-restore": {{ docker_live_restore | lower }}
+      }
+    owner: root
+    group: root
+    mode: "0644"
+  register: docker_daemon_config
+  notify: Reiniciar Docker
+
+- name: Habilitar y arrancar el servicio Docker
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Comprobar que el demonio responde
+  ansible.builtin.command:
+    argv: [docker, version, --format, "{{ docker_version_format }}"]
+  register: docker_info
+  changed_when: false
+  retries: 5
+  delay: 3
+  until: docker_info is succeeded
+
+- name: Mostrar la version del demonio
+  ansible.builtin.debug:
+    msg: "Docker Engine {{ docker_info.stdout }} operativo en {{ inventory_hostname }}"

@@ -1,0 +1,126 @@
+---
+# Requisito #3 (parte 1) - CI: comprueba la API contra MongoDB en cada push y PR.
+#
+# Levanta el stack de docker-compose.yml tal cual lo haria un usuario, espera a los
+# healthchecks y recorre el CRUD completo de /todos. Si algo falla, el pipeline para
+# antes de publicar una imagen.
+#
+# No necesita secrets: MongoDB corre con las credenciales por defecto del .env.example.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "api/**"
+      - "docker-compose.yml"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "api/**"
+      - "docker-compose.yml"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    name: Build and smoke test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Poner en marcha el stack (API + MongoDB)
+        run: docker compose up -d --build --wait --wait-timeout 180
+
+      - name: Estado del stack
+        if: always()
+        run: docker compose ps
+
+      - name: Registros de los contenedores
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Probar el CRUD completo de /todos
+        env:
+          BASE_URL: http://localhost:3000
+        run: |
+          set -euo pipefail
+
+          echo "::group::healthcheck"
+          curl --fail --silent --show-error "${BASE_URL}/health"
+          echo
+          echo "::endgroup::"
+
+          echo "::group::POST /todos"
+          created=$(curl --fail --silent --show-error \
+            -X POST "${BASE_URL}/todos" \
+            -H 'Content-Type: application/json' \
+            -d '{"task":"Comprar pan","completed":false}')
+          echo "$created"
+          id=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1])._id))" "$created")
+          echo "created id: ${id}"
+          echo "::endgroup::"
+
+          echo "::group::GET /todos/:id"
+          curl --fail --silent --show-error "${BASE_URL}/todos/${id}"
+          echo
+          echo "::endgroup::"
+
+          echo "::group::PUT /todos/:id"
+          updated=$(curl --fail --silent --show-error \
+            -X PUT "${BASE_URL}/todos/${id}" \
+            -H 'Content-Type: application/json' \
+            -d '{"completed":true}')
+          echo "$updated"
+          node -e "const t=JSON.parse(process.argv[1]); if(t.completed!==true){throw new Error('completed no se actualizo')}" "$updated"
+          echo "::endgroup::"
+
+          echo "::group::GET /todos"
+          curl --fail --silent --show-error "${BASE_URL}/todos"
+          echo
+          echo "::endgroup::"
+
+          echo "::group::DELETE /todos/:id"
+          curl --fail --silent --show-error -X DELETE "${BASE_URL}/todos/${id}"
+          echo
+          echo "::endgroup::"
+
+          echo "::group::Comprobar que ya no existe"
+          status=$(curl --silent --output /dev/null --write-out '%{http_code}' "${BASE_URL}/todos/${id}")
+          test "$status" = "404"
+          echo "GET /todos/${id} -> ${status} (esperado 404)"
+          echo "::endgroup::"
+
+      - name: Comprobar que los datos persisten tras recrear los contenedores
+        env:
+          BASE_URL: http://localhost:3000
+        run: |
+          set -euo pipefail
+
+          curl --fail --silent --show-error \
+            -X POST "${BASE_URL}/todos" \
+            -H 'Content-Type: application/json' \
+            -d '{"task":"Tarea persistente"}' > /dev/null
+
+          # `down` sin -v conserva los volumenes nombrados; recreate fuerza a rehacer
+          # los contenedores sin tocar /data/db.
+          docker compose down
+          docker compose up -d --wait --wait-timeout 120
+
+          curl --fail --silent --show-error "${BASE_URL}/todos" \
+            | grep -q 'Tarea persistente'
+          echo "OK: los datos sobreviven a la recreacion de los contenedores"
+
+      - name: Destruir el stack
+        if: always()
+        run: docker compose down -v --remove-orphans

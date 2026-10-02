@@ -1,0 +1,304 @@
+---
+# Requisito #3 (parte 2) - CD: publica la imagen y despliega el stack con Docker Compose.
+#
+#   1. build   -> construye la imagen y la sube a Docker Hub (etiquetas `latest` y `sha-<corto>`)
+#   2. deploy  -> se conecta al Droplet por SSH, sube los ficheros de compose, nginx y el
+#                 .env.production, y ejecuta `docker compose pull && up -d --wait`
+#   3. smoke   -> comprueba el CRUD contra el servidor ya desplegado
+#
+# El despliegue usa solo ssh/rsync nativos del runner (sin acciones de terceros).
+# Ninguna credencial viaja en la linea de comandos: viajan por stdin o por fichero.
+#
+# Secrets (Settings -> Secrets and variables -> Actions):
+#   DOCKERHUB_USERNAME    usuario de Docker Hub
+#   DOCKERHUB_TOKEN       access token de Docker Hub (no la contraseña de la cuenta)
+#   SERVER_HOST           IP publica del Droplet
+#   SERVER_SSH_KEY        clave privada SSH con acceso al Droplet (usuario `deploy`)
+#   MONGO_ROOT_PASSWORD   contrasena de MongoDB en produccion
+# Opcionales:
+#   SERVER_HOST_KEY       host key del Droplet. Sin ella se usa ssh-keyscan.
+# Variables:
+#   SERVER_USER           usuario SSH en el servidor (por defecto: deploy)
+#   MONGO_ROOT_USERNAME   usuario de MongoDB en produccion (por defecto: root)
+name: CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "api/**"
+      - "docker-compose.prod.yml"
+      - "nginx/**"
+      - ".github/workflows/cd.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Etiqueta a desplegar (vacio = la del commit actual)"
+        required: false
+        default: ""
+
+concurrency:
+  group: cd-production
+  # Nunca cancelar un despliegue a medias: podria dejar el stack inconsistente.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_PATH: /opt/todos
+  COMPOSE_FILE: docker-compose.prod.yml
+  SERVER_USER: ${{ vars.SERVER_USER || 'deploy' }}
+  MONGO_ROOT_USERNAME: ${{ vars.MONGO_ROOT_USERNAME || 'root' }}
+
+jobs:
+  build:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    outputs:
+      deploy_image: ${{ steps.tag.outputs.value }}
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Autenticarse en Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Poner Buildx en marcha
+        uses: docker/setup-buildx-action@v3
+
+      - name: Calcular las etiquetas y los metadatos de la imagen
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/todos-api
+          labels: |
+            org.opencontainers.image.title=todos-api
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{branch == 'main'}}
+
+      - name: Construir y publicar la imagen
+        uses: docker/build-push-action@v6
+        with:
+          context: ./api
+          target: runner
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resolver la etiqueta a desplegar
+        id: tag
+        env:
+          REQUESTED_TAG: ${{ inputs.image_tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Se despliega la etiqueta inmutable del commit: si el runner falla a mitad,
+          # el siguiente despliegue sigue siendo el mismo artefacto.
+          tag="${REQUESTED_TAG:-$VERSION}"
+          image="${{ secrets.DOCKERHUB_USERNAME }}/todos-api:${tag}"
+          echo "value=${image}" >> "$GITHUB_OUTPUT"
+          echo "Desplegando ${image}"
+
+      - name: Comprobar que la imagen existe en el registro
+        run: docker manifest inspect "${{ steps.tag.outputs.value }}" > /dev/null
+
+  deploy:
+    name: Deploy with docker compose
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar la clave SSH del servidor
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/id_deploy_server
+          chmod 600 ~/.ssh/id_deploy_server
+
+      - name: Registrar la host key del servidor
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_HOST_KEY: ${{ secrets.SERVER_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          touch ~/.ssh/known_hosts
+          if [ -n "${SERVER_HOST_KEY:-}" ]; then
+            printf '%s\n' "$SERVER_HOST_KEY" >> ~/.ssh/known_hosts
+          else
+            # ssh-keyscan no autentica nada: es vulnerable a MITM. Guarda la huella
+            # real del Droplet en SERVER_HOST_KEY para despliegue serio.
+            ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+          fi
+
+      - name: Generar las credenciales de Docker Hub para el servidor
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # `docker login` propio genera el config.json correcto (auth base64).
+          # El token entra por stdin, nunca por argv.
+          export DOCKER_CONFIG="${RUNNER_TEMP}/docker-config"
+          mkdir -p "$DOCKER_CONFIG"
+          printf '%s' "$DOCKERHUB_TOKEN" \
+            | docker login --username "$DOCKERHUB_USERNAME" --password-stdin > /dev/null
+
+      - name: Escribir el fichero de entorno de produccion
+        env:
+          API_IMAGE: ${{ needs.build.outputs.deploy_image }}
+          MONGO_ROOT_PASSWORD: ${{ secrets.MONGO_ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 .staging
+          umask 077
+          cat > .staging/.env.production <<EOF
+          API_IMAGE=${API_IMAGE}
+          MONGO_ROOT_USERNAME=${MONGO_ROOT_USERNAME}
+          MONGO_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD}
+          MONGO_DATABASE=todos
+          MONGO_VOLUME_NAME=todos-mongo-data
+          HTTP_PORT=80
+          HTTPS_PORT=443
+          EOF
+
+      - name: Sincronizar los ficheros del stack con el servidor
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          set -euo pipefail
+          remote="${SERVER_USER}@${SERVER_HOST}"
+          ssh_opts=(-i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes)
+
+          ssh "${ssh_opts[@]}" "$remote" "mkdir -p '${DEPLOY_PATH}/nginx/conf.d'"
+
+          # Solo viajan los ficheros que forman el stack: el codigo va dentro de la imagen.
+          rsync -az -e "ssh -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes" \
+            ./docker-compose.prod.yml "$remote:${DEPLOY_PATH}/${COMPOSE_FILE}"
+
+          rsync -az -e "ssh -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes" \
+            ./nginx/conf.d/default.conf "$remote:${DEPLOY_PATH}/nginx/conf.d/default.conf"
+
+          # Contiene credenciales: el script remoto lo deja en 0600.
+          rsync -az -e "ssh -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes" \
+            .staging/.env.production "$remote:${DEPLOY_PATH}/.env.production"
+
+          # Credenciales de Docker Hub, tambien en 0600 y borradas al final del deploy.
+          # Ruta fija: `export` de un step anterior no sobrevive al siguiente step.
+          rsync -az -e "ssh -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes" \
+            "${RUNNER_TEMP}/docker-config/config.json" \
+            "$remote:${DEPLOY_PATH}/.docker-config.json"
+
+      - name: Desplegar el stack con Docker Compose
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          set -euo pipefail
+
+          # El script viaja por stdin, pero ssh NO reenvia el entorno local: por eso
+          # las dos variables no secretas se pasan como prefijo del comando remoto.
+          # El resto de credenciales ya viajan en ficheros o por stdin.
+          ssh -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes \
+            "${SERVER_USER}@${SERVER_HOST}" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' COMPOSE_FILE='${COMPOSE_FILE}' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          deploy_path="${DEPLOY_PATH}"
+          compose_file="${COMPOSE_FILE}"
+
+          cd "$deploy_path"
+
+          # El usuario `deploy` ya esta en el grupo docker (lo crea el rol de Ansible),
+          # asi que habla con el demonio sin sudo.
+          docker info > /dev/null
+
+          install -d -m 700 "${HOME}/.docker"
+          install -m 600 "${deploy_path}/.docker-config.json" "${HOME}/.docker/config.json"
+          rm -f "${deploy_path}/.docker-config.json"
+
+          # `config` valida el YAML y la interpolacion de variables antes de tocar nada.
+          docker compose --env-file .env.production -f "$compose_file" config --quiet
+
+          docker compose --env-file .env.production -f "$compose_file" pull
+
+          # --remove-orphans retira contenedores de despliegues anteriores.
+          # --wait devuelve error si algun servicio no llega a healthy.
+          docker compose --env-file .env.production -f "$compose_file" \
+            up -d --remove-orphans --wait --wait-timeout 180
+
+          docker compose --env-file .env.production -f "$compose_file" ps
+
+          # No dejar la sesion de Docker Hub abierta en un servidor compartido.
+          rm -f "${HOME}/.docker/config.json"
+          REMOTE
+
+      - name: Limpiar los ficheros temporales del runner
+        if: always()
+        run: rm -rf .staging "${RUNNER_TEMP}/docker-config"
+
+  smoke-test:
+    name: Verify the deployed stack
+    needs: deploy
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Comprobar la API a traves del reverse proxy
+        env:
+          BASE_URL: http://${{ secrets.SERVER_HOST }}
+        run: |
+          set -euo pipefail
+
+          for i in $(seq 1 6); do
+            if curl --fail --silent --show-error "${BASE_URL}/health" > /dev/null; then
+              echo "La API responde en ${BASE_URL}"
+              exit 0
+            fi
+            echo "Intento ${i}/6: aun no responde, reintentando en 10s..."
+            sleep 10
+          done
+
+          echo "::error::La API no responde en ${BASE_URL}/health"
+          exit 1
+
+      - name: Comprobar el CRUD contra produccion
+        env:
+          BASE_URL: http://${{ secrets.SERVER_HOST }}
+        run: |
+          set -euo pipefail
+
+          created=$(curl --fail --silent --show-error \
+            -X POST "${BASE_URL}/todos" \
+            -H 'Content-Type: application/json' \
+            -d '{"task":"Verificacion del pipeline"}')
+          id=$(node -e "process.stdout.write(String(JSON.parse(process.argv[1])._id))" "$created")
+          echo "Creado ${id}"
+
+          curl --fail --silent --show-error "${BASE_URL}/todos/${id}" > /dev/null
+
+          curl --fail --silent --show-error \
+            -X PUT "${BASE_URL}/todos/${id}" \
+            -H 'Content-Type: application/json' \
+            -d '{"completed":true}' > /dev/null
+
+          curl --fail --silent --show-error -X DELETE "${BASE_URL}/todos/${id}" > /dev/null
+
+          status=$(curl --silent --output /dev/null --write-out '%{http_code}' "${BASE_URL}/todos/${id}")
+          test "$status" = "404"
+
+          echo "OK: CRUD completo verificado a traves del reverse proxy"

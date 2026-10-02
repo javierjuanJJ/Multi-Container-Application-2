@@ -70,3 +70,41 @@ variable "ssh_key_fingerprint" {
   type        = string
   default     = null
 }
+
+variable "allowed_ssh_ips" {
+  description = <<-EOT
+    Origenes permitidos a entrar por SSH en el Cloud Firewall. Lista vacia = cualquier
+    IP puede entrar por el puerto 22 (solo aceptable para una practica).
+  EOT
+  type        = list(string)
+  default     = []
+}
+
+variable "open_web_ports" {
+  description = "Abre 80/443 en el Cloud Firewall, necesario para el reverse proxy de nginx."
+  type        = bool
+  default     = true
+}
+
+variable "domain_name" {
+  description = "Dominio de DigitalOcean donde crear el registro DNS del bonus. Si es null no se crea."
+  type        = string
+  default     = null
+}
+
+variable "domain_record_name" {
+  description = "Nombre del subdominio del registro DNS del bonus (ej. app o @)."
+  type        = string
+  default     = "@"
+}
+
+variable "domain_record_type" {
+  description = "Tipo del registro DNS del bonus (A para apuntar al Droplet)."
+  type        = string
+  default     = "A"
+
+  validation {
+    condition     = contains(["A", "AAAA", "CNAME"], var.domain_record_type)
+    error_message = "domain_record_type debe ser A, AAAA o CNAME."
+  }
+}

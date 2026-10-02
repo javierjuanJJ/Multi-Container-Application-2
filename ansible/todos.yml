@@ -1,0 +1,32 @@
+---
+# Requisito #2 - Puesta en marcha del servidor y despliegue con Docker Compose.
+#
+#   ansible-playbook todos.yml
+#
+# El grupo [app] apunta al Droplet creado con Terraform (ver inventory.ini):
+#   terraform -chdir=terraform output -raw ansible_inventory_host
+#
+# Que hace, en orden:
+#   1. rol docker -> instala Docker Engine + el plugin de Compose
+#   2. rol app    -> copia los ficheros de compose y nginx, tira la imagen de
+#                    Docker Hub y levanta el stack (api + mongo + nginx)
+#
+# Secretos: la contrasena de MongoDB debe venir de un vault, nunca del inventario.
+#   ansible-vault encrypt_string 'mi-contrasena' --name 'app_mongo_password'
+#   ansible-playbook todos.yml --ask-vault-pass
+- name: Desplegar la aplicacion de todos con Docker Compose
+  hosts: app
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: docker
+      tags: [docker, always]
+
+    - role: app
+      tags: [app]
+      vars:
+        # El usuario que ejecuta `docker compose` en el servidor. Debe existir
+        # (lo crea el rol docker) y pertenecer al grupo docker.
+        app_user: deploy
+        app_group: docker

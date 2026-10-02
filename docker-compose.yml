@@ -1,0 +1,108 @@
+# ---------------------------------------------------------------------------
+# Requisito #1 - Dockerizar la API
+#
+#   docker compose up -d --build     -> API en http://localhost:3000
+#   docker compose --profile dev up -d api-dev   -> API con nodemon en :3001
+#
+# Los datos viven en el volumen nombrado `todos-mongo-data`, asi que sobreviven a
+# `docker compose stop` / `start` y a `down` (solo `down -v` los borra).
+# ---------------------------------------------------------------------------
+
+name: todos
+
+services:
+  mongo:
+    image: mongo:8.0
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-todos-dev-password}
+      MONGO_INITDB_DATABASE: ${MONGO_DATABASE:-todos}
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      # Autentica de verdad: valida que el servidor responde Y que las credenciales
+      # del .env son correctas. `$$` escapa el $ para que lo exponga el shell del
+      # contenedor, no compose.
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet
+          --username "$$MONGO_INITDB_ROOT_USERNAME"
+          --password "$$MONGO_INITDB_ROOT_PASSWORD"
+          --authenticationDatabase admin
+          --eval "db.adminCommand('ping').ok" | grep -q 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - backend
+
+  api:
+    build:
+      context: ./api
+      target: runner
+    image: ${API_IMAGE:-todos-api:local}
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      MONGO_URI: mongodb://${MONGO_ROOT_USERNAME:-root}:${MONGO_ROOT_PASSWORD:-todos-dev-password}@mongo:27017/${MONGO_DATABASE:-todos}?authSource=admin
+    depends_on:
+      mongo:
+        # Espera a que Mongo acepte conexiones: evita el "connection refused" clasico
+        # al arrancar el stack entero de golpe.
+        condition: service_healthy
+        # Si se reinicia mongo, compose reinicia tambien la API.
+        restart: true
+    # Mismo healthcheck que el del Dockerfile, declarado aqui para que
+    # `docker compose up --wait` no dependa de la metadata de la imagen.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - backend
+      - frontend
+
+  # Variante de desarrollo: nodemon recarga el codigo montado desde el host.
+  api-dev:
+    profiles: ["dev"]
+    build:
+      context: ./api
+      target: dev
+    image: todos-api:dev
+    restart: unless-stopped
+    ports:
+      - "${API_DEV_PORT:-3001}:3000"
+    environment:
+      NODE_ENV: development
+      PORT: "3000"
+      MONGO_URI: mongodb://${MONGO_ROOT_USERNAME:-root}:${MONGO_ROOT_PASSWORD:-todos-dev-password}@mongo:27017/${MONGO_DATABASE:-todos}?authSource=admin
+    volumes:
+      - ./api/src:/usr/src/app/src
+      - /usr/src/app/node_modules
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks:
+      - backend
+      - frontend
+
+volumes:
+  mongo-data:
+    # Nombre global explicito: los datos no se pierden aunque cambie el nombre del
+    # proyecto de compose o se alternate entre compose.yml y compose.prod.yml.
+    name: ${MONGO_VOLUME_NAME:-todos-mongo-data}
+
+networks:
+  # Red solo de datos: sin salida a internet. MongoDB no necesita exposicion al exterior.
+  backend:
+    internal: true
+  # Red de entrada: la comparte la API con el reverse proxy en produccion.
+  frontend:

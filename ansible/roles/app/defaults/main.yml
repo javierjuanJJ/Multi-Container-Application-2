@@ -1,39 +1,41 @@
 ---
 # Valores por defecto del rol `app`. Se pueden sobreescribir sin editar el rol:
-#   ansible-playbook node_service.yml --tags app -e app_branch=staging
+#   ansible-playbook todos.yml -e app_image=mi-usuario/todos-api:1.2.3
 
-# Donde vive el codigo en el servidor
-app_dir: /srv/node-service
-app_user: nodeapp
-app_group: nodeapp
+# Donde vive el stack en el servidor
+app_dir: /opt/todos
+app_user: deploy
+app_group: docker
 
-# Repositorio. Usa SSH (git@github.com:OWNER/REPO.git) con deploy key, o HTTPS si
-# el repositorio es publico.
-app_repo: https://github.com/OWNER/REPO.git
-app_branch: main
-app_commit: ""          # si se define, hace checkout exacto de ese sha (despliegue inmutable)
-app_repo_force_update: true
+# Raiz del repositorio en la maquina de control: de aqui se copian los ficheros
+# de compose y la configuracion de nginx al Droplet.
+app_project_root: "{{ playbook_dir | dirname }}"
 
-# Clave publica del runner de GitHub Actions. Si se define, se copia a
-# authorized_keys del usuario de despliegue para que el servidor pueda tirar de ella
-# (complementa a la deploy key, por ejemplo para git fetch de repos privados).
-app_runner_ssh_public_key: ""
+# Ficheros del stack
+app_compose_file_src: "{{ app_project_root }}/docker-compose.prod.yml"
+app_compose_file_name: docker-compose.prod.yml
+app_nginx_conf_src: "{{ app_project_root }}/nginx/conf.d/default.conf"
 
-# Clave privada de despliegue (deploy key). Solo se usa si el repo es privado.
-# En GitHub Actions se inyecta desde el secret APP_DEPLOY_KEY con
-#   -e app_deploy_key="$APP_DEPLOY_KEY"
-app_deploy_key: ""
-app_deploy_key_path: /home/{{ app_user }}/.ssh/id_deploy
-app_known_hosts: "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+# Variables de la imagen publicada por el pipeline
+app_image: ""
+app_registry_username: ""
+app_registry_password: ""
 
-# Toolchain
-nodejs_version: "20.x"
-npm_always_install: true
+# Secretos de MongoDB. Guardalos en un vault, nunca en el inventario ni en git:
+#   ansible-vault encrypt_string 'contrasena-larga-y-aleatoria' --name 'mongo_password'
+app_mongo_username: root
+app_mongo_password: ""
+app_mongo_database: todos
+app_mongo_volume_name: todos-mongo-data
 
-# Servicio. La app escucha directamente en app_port (80 por defecto).
-# El rol apaga nginx si viene instalado del proyecto anterior para no competir por el puerto.
-app_port: 80
-app_service_name: node-service
-app_service_description: "Node.js service (Hello, world!)"
-app_node_env: "production"
-app_healthcheck_path: /healthz
+# Puertos publicados por el reverse proxy
+app_http_port: 80
+app_https_port: 443
+
+# Etiqueta usada para --env-file
+app_env_file: .env.production
+
+# Healthcheck contra el reverse proxy
+app_healthcheck_path: /health
+app_healthcheck_host: 127.0.0.1
+app_healthcheck_status: 200

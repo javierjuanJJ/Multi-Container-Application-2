@@ -1,0 +1,112 @@
+# ---------------------------------------------------------------------------
+# Requisito #2 y #3 - Produccion (Droplet)
+# Bonus           - Reverse proxy con Nginx
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.production \
+#       up -d --remove-orphans --wait
+#
+# Diferencias con docker-compose.yml:
+#   - la API se tira (pull) del registro, no se construye en el servidor
+#   - ni la API ni MongoDB publican puertos en el host: solo Nginx (80/443)
+#   - el proxy traduce http://your_domain.com -> http://api:3000
+#
+# La API sigue siendo alcanzable en el puerto 3000 por si se quiere saltar el proxy:
+#   ssh root@<ip> 'curl http://127.0.0.1:3000/health'
+# Para publicarla de nuevo, descomentar el bloque `ports` del servicio `api`.
+# ---------------------------------------------------------------------------
+
+name: todos-prod
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    restart: always
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      # Sustituye el default.conf que trae la imagen. Solo lectura.
+      - ./nginx/conf.d/default.conf:/etc/nginx/conf.d/default.conf:ro
+      # Certificados si habilitas el bloque HTTPS (ver nginx/conf.d/default.conf).
+      # - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      # wget de busybox: `-q -O /dev/null` es la forma más portable (nginx:alpine
+      # no trae curl). Devuelve error si nginx no responde 200.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/nginx-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - frontend
+
+  api:
+    image: ${API_IMAGE:?define API_IMAGE en .env.production}
+    restart: always
+    # Descomentar para exponer la API directamente en el host ademas del proxy.
+    # ports:
+    #   - "${API_PORT:-3000}:3000"
+    expose:
+      - "3000"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # nginx es el unico proxy delante: hace falta para que Express resuelva
+      # req.ip y req.protocol a partir de X-Forwarded-*.
+      TRUST_PROXY: "true"
+      MONGO_URI: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD:?define MONGO_ROOT_PASSWORD en .env.production}@mongo:27017/${MONGO_DATABASE:-todos}?authSource=admin
+    depends_on:
+      mongo:
+        condition: service_healthy
+    # Declarado tambien aqui (y no solo en el Dockerfile) porque nginx arranca
+    # con `condition: service_healthy`: el contrato de salud debe vivir en el
+    # manifiesto de despliegue, no dentro de la imagen.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - backend
+      - frontend
+
+  mongo:
+    image: mongo:8.0
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?define MONGO_ROOT_USERNAME en .env.production}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?define MONGO_ROOT_PASSWORD en .env.production}
+      MONGO_INITDB_DATABASE: ${MONGO_DATABASE:-todos}
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      # Autentica de verdad: valida que el servidor responde Y que las credenciales
+      # del .env.production son correctas. `$$` escapa el $ para que lo exponga el
+      # shell del contenedor, no compose.
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet
+          --username "$$MONGO_INITDB_ROOT_USERNAME"
+          --password "$$MONGO_INITDB_ROOT_PASSWORD"
+          --authenticationDatabase admin
+          --eval "db.adminCommand('ping').ok" | grep -q 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - backend
+
+volumes:
+  mongo-data:
+    name: ${MONGO_VOLUME_NAME:-todos-mongo-data}
+
+networks:
+  backend:
+    internal: true
+  frontend:

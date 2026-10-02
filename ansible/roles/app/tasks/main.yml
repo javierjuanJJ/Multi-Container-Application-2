@@ -1,67 +1,24 @@
 ---
-- name: Instalar python3-debian (requisito de deb822_repository)
-  ansible.builtin.apt:
-    name: python3-debian
-    state: present
-    update_cache: true
-    cache_valid_time: 3600
+# ---------------------------------------------------------------------------
+# Requisito #2 y #3 - Desplegar el stack con Docker Compose en el Droplet
+#
+# Copia los ficheros de compose + la config de nginx al servidor, tira la imagen
+# publicada en Docker Hub y levanta el stack. MongoDB nunca se reinicia con
+# `up -d`, asi que los datos del volumen sobreviven a cada despliegue.
+# ---------------------------------------------------------------------------
 
-- name: Registrar el repositorio de NodeSource
-  ansible.builtin.deb822_repository:
-    name: nodesource
-    description: "Node.js Source"
-    types:
-      - deb
-    uris: "https://deb.nodesource.com/node_{{ nodejs_version }}"
-    suites: nodistro
-    components:
-      - main
-    signed_by: https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
-    state: present
-  register: app_nodesource
-  # Reintenta: si el repositorio se acaba de anadir, apt aun puede fallar por cache
-  retries: 3
-  delay: 5
-  until: app_nodesource is succeeded
+- name: Validar que la imagen de la API esta definida
+  ansible.builtin.assert:
+    that:
+      - app_image | length > 0
+      - app_mongo_password | length > 0
+    fail_msg: >-
+      Faltan app_image y/o app_mongo_password. Pasa la imagen con
+      -e app_image=mi-usuario/todos-api:<tag> y la contrasena desde el vault
+      (vars_files o --extra-vars).
+    quiet: true
 
-- name: Actualizar la cache de paquetes
-  ansible.builtin.apt:
-    update_cache: true
-    cache_valid_time: 3600
-  when: app_nodesource is changed
-
-- name: Instalar Node.js y npm
-  ansible.builtin.apt:
-    name:
-      - nodejs
-    state: present
-  register: app_node_install
-
-- name: Comprobar la version de Node.js instalada
-  ansible.builtin.command: node --version
-  register: app_node_version
-  changed_when: false
-
-- name: Comprobar la version de npm instalada
-  ansible.builtin.command: npm --version
-  register: app_npm_version
-  changed_when: false
-
-- name: Mostrar las versiones instaladas
-  ansible.builtin.debug:
-    msg: "Node.js {{ app_node_version.stdout }} | npm {{ app_npm_version.stdout }}"
-
-- name: Crear el grupo y el usuario de la aplicacion
-  ansible.builtin.user:
-    name: "{{ app_user }}"
-    group: "{{ app_group }}"
-    home: "/home/{{ app_user }}"
-    shell: /bin/bash
-    system: true
-    create_home: true
-    state: present
-
-- name: Crear el directorio de despliegue
+- name: Crear el directorio del stack
   ansible.builtin.file:
     path: "{{ app_dir }}"
     state: directory
@@ -69,138 +26,144 @@
     group: "{{ app_group }}"
     mode: "0755"
 
-- name: Crear el directorio .ssh del usuario de despliegue
+- name: Crear el directorio de configuracion de nginx
   ansible.builtin.file:
-    path: "/home/{{ app_user }}/.ssh"
+    path: "{{ app_dir }}/nginx/conf.d"
     state: directory
     owner: "{{ app_user }}"
     group: "{{ app_group }}"
-    mode: "0700"
-  when: app_repo is match('^git@')
+    mode: "0755"
 
-- name: Instalar la clave publica del runner de GitHub Actions
+- name: Copiar el fichero de compose de produccion
   ansible.builtin.copy:
-    dest: "/home/{{ app_user }}/.ssh/authorized_keys"
-    content: "{{ app_runner_ssh_public_key }}\n"
-    owner: "{{ app_user }}"
-    group: "{{ app_group }}"
-    mode: "0600"
-  when: app_runner_ssh_public_key | length > 0
-
-- name: Instalar la deploy key privada en el servidor
-  ansible.builtin.copy:
-    dest: "{{ app_deploy_key_path }}"
-    content: "{{ app_deploy_key }}"
-    owner: "{{ app_user }}"
-    group: "{{ app_group }}"
-    mode: "0600"
-  no_log: true
-  when: app_deploy_key | length > 0
-
-- name: Fijar el host de GitHub para evitar prompts de known_hosts
-  ansible.builtin.copy:
-    dest: "/home/{{ app_user }}/.ssh/known_hosts"
-    content: "{{ app_known_hosts }}\n"
-    owner: "{{ app_user }}"
-    group: "{{ app_group }}"
-    mode: "0600"
-  when: app_repo is match('^git@')
-
-- name: Dar a git la ruta de la deploy key
-  ansible.builtin.copy:
-    dest: "/home/{{ app_user }}/.gitconfig"
-    content: |
-      [safe]
-      	default = *
-      [core]
-      	sshCommand = ssh -i {{ app_deploy_key_path }} -o IdentitiesOnly=yes
+    src: "{{ app_compose_file_src }}"
+    dest: "{{ app_dir }}/{{ app_compose_file_name }}"
     owner: "{{ app_user }}"
     group: "{{ app_group }}"
     mode: "0644"
-  when:
-    - app_repo is match('^git@')
-    - app_deploy_key | length > 0
+  register: app_compose_file
 
-- name: Clonar o actualizar el repositorio
-  become_user: "{{ app_user }}"
-  ansible.builtin.git:
-    repo: "{{ app_repo }}"
-    dest: "{{ app_dir }}/app"
-    version: "{{ app_commit | default(app_branch, true) }}"
-    force: "{{ app_repo_force_update }}"
-    accept_hostkey: true
-    # Clon superficial para desplegar una rama; historial completo para fixear un sha
-    depth: "{{ 0 if (app_commit | length > 0) else 1 }}"
-  register: app_clone
+- name: Copiar la configuracion del reverse proxy
+  ansible.builtin.copy:
+    src: "{{ app_nginx_conf_src }}"
+    dest: "{{ app_dir }}/nginx/conf.d/default.conf"
+    owner: "{{ app_user }}"
+    group: "{{ app_group }}"
+    mode: "0644"
+  register: app_nginx_conf
 
-- name: Instalar las dependencias de produccion
-  become_user: "{{ app_user }}"
-  community.general.npm:
-    path: "{{ app_dir }}/app"
-    state: present
-    production: true
-    ci: true
-  when: app_clone is changed
-  register: app_npm_install
-
-- name: Construir la aplicacion
-  become_user: "{{ app_user }}"
-  ansible.builtin.command: npm run build
-  args:
-    chdir: "{{ app_dir }}/app"
-  when: app_clone is changed
-  changed_when: true
-  register: app_build
-
-- name: Recopilar el estado de los servicios del sistema
-  ansible.builtin.service_facts:
-
-- name: Apagar nginx si viene instalado del proyecto anterior (compite por el puerto 80)
-  ansible.builtin.systemd_service:
-    name: nginx
-    state: stopped
-    enabled: false
-  when:
-    - app_port == 80
-    - ansible_facts.services.get('nginx.service') is defined
-
-- name: Instalar la unidad systemd del servicio
+- name: Generar el fichero de variables de entorno
   ansible.builtin.template:
-    src: node-service.service.j2
-    dest: "/etc/systemd/system/{{ app_service_name }}.service"
-    owner: root
-    group: root
-    mode: "0644"
-  register: app_unit
+    src: env.production.j2
+    dest: "{{ app_dir }}/{{ app_env_file }}"
+    owner: "{{ app_user }}"
+    group: "{{ app_group }}"
+    mode: "0600" # contiene la contrasena de MongoDB
+  no_log: true
+  register: app_env
 
-- name: Habilitar el servicio en el arranque
-  ansible.builtin.systemd_service:
-    name: "{{ app_service_name }}"
-    enabled: true
+# Fallar aqui si el YAML es invalido es mucho mejor que fallar en `up -d`.
+- name: Validar la configuracion de compose
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - --env-file
+      - "{{ app_env_file }}"
+      - -f
+      - "{{ app_compose_file_name }}"
+      - config
+      - --quiet
+  args:
+    chdir: "{{ app_dir }}"
+  become_user: "{{ app_user }}"
+  changed_when: false
 
-# El reinicio se hace como tarea y no como handler: asi ocurre antes del healthcheck
-- name: Reiniciar el servicio si algo cambio
-  ansible.builtin.systemd_service:
-    name: "{{ app_service_name }}"
-    state: restarted
-    daemon_reload: true
-  when: >-
-    app_unit is changed or
-    app_clone is changed or
-    app_npm_install is changed or
-    app_build is changed or
-    app_node_install is changed
+- name: Autenticarse en el registro de imagenes
+  ansible.builtin.command:
+    argv: [docker, login, --username, "{{ app_registry_username }}", --password-stdin]
+  args:
+    stdin: "{{ app_registry_password }}"
+    chdir: "{{ app_dir }}"
+  become_user: "{{ app_user }}"
+  no_log: true
+  changed_when: true
+  when:
+    - app_registry_username | length > 0
+    - app_registry_password | length > 0
 
-- name: Esperar a que el servicio responda
+- name: Descargar las imagenes del stack
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - --env-file
+      - "{{ app_env_file }}"
+      - -f
+      - "{{ app_compose_file_name }}"
+      - pull
+  args:
+    chdir: "{{ app_dir }}"
+  become_user: "{{ app_user }}"
+  register: app_pull
+  changed_when: "'Downloading' in app_pull.stdout or 'Pulled' in app_pull.stdout"
+
+# --remove-orphans limpia contenedores de despliegues anteriores.
+# Sin -d se espera al healthcheck de mongo y de la API antes de dar el paso por bueno.
+- name: Levantar o actualizar el stack
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - --env-file
+      - "{{ app_env_file }}"
+      - -f
+      - "{{ app_compose_file_name }}"
+      - up
+      - -d
+      - --remove-orphans
+      - --wait
+      - --wait-timeout
+      - "120"
+  args:
+    chdir: "{{ app_dir }}"
+  become_user: "{{ app_user }}"
+  register: app_up
+  changed_when: true
+
+- name: Mostrar el estado del stack
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - --env-file
+      - "{{ app_env_file }}"
+      - -f
+      - "{{ app_compose_file_name }}"
+      - ps
+  args:
+    chdir: "{{ app_dir }}"
+  become_user: "{{ app_user }}"
+  changed_when: false
+  register: app_ps
+
+- name: Estado de los contenedores
+  ansible.builtin.debug:
+    msg: "{{ app_ps.stdout_lines }}"
+
+- name: Comprobar la salud de la API a traves del reverse proxy
   ansible.builtin.uri:
-    url: "http://127.0.0.1:{{ app_port }}{{ app_healthcheck_path }}"
-    status_code: 200
+    url: "http://{{ app_healthcheck_host }}:{{ app_http_port }}{{ app_healthcheck_path }}"
+    status_code: "{{ app_healthcheck_status }}"
     return_content: true
   register: app_healthcheck
   retries: 10
-  delay: 3
+  delay: 5
   until: app_healthcheck is succeeded
 
-- name: Mostrar el resultado del despliegue
+- name: Resultado del despliegue
   ansible.builtin.debug:
-    msg: "{{ app_service_name }} desplegado en el puerto {{ app_port }} ({{ app_healthcheck.json.status }})"
+    msg: >-
+      Stack desplegado con {{ app_image }} en
+      http://{{ app_healthcheck_host }}:{{ app_http_port }}
+      (healthcheck: {{ app_healthcheck.json.status }})
