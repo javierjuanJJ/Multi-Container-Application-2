@@ -19,6 +19,7 @@ Aplicación de lista de tareas desplegada con **Docker Compose**, provisionada c
   - [Terraform](#terraform)
   - [Ansible](#ansible)
 - [Requisito 3 — Pipeline de CI/CD](#requisito-3--pipeline-de-cicd)
+- [Backups automáticos de la base de datos](#backups-automáticos-de-la-base-de-datos)
 - [Bonus — Reverse proxy con Nginx](#bonus--reverse-proxy-con-nginx)
 - [Seguridad](#seguridad)
 - [Limpieza](#limpieza)
@@ -50,7 +51,11 @@ Aplicación de lista de tareas desplegada con **Docker Compose**, provisionada c
 │   └── roles/{docker,app}/
 ├── .github/workflows/
 │   ├── ci.yml                    # REQ 3: smoke test del CRUD en cada push
-│   └── cd.yml                    # REQ 3: publica la imagen y despliega
+│   ├── cd.yml                    # REQ 3: publica la imagen y despliega
+│   └── backup.yml                # copia de MongoDB a R2 cada 12 horas
+├── scripts/
+│   ├── mongo-backup.sh           # mongodump -> tarball (corre en el servidor)
+│   └── mongo-restore.sh          # descarga de R2 y restaura
 ├── .env.example                  # variables para desarrollo
 └── .env.production.example       # variables para el servidor
 ```
@@ -293,6 +298,137 @@ Si el repositorio es privado, añade `packages: write` a `permissions` y usa
 
 ---
 
+## Backups automáticos de la base de datos
+
+Copia de MongoDB cada 12 horas en un tarball, subida a **Cloudflare R2** (tiene
+tier gratuito de almacenamiento), más el script para restaurarla.
+
+### `backup.yml` — copia programada
+
+Cron `0 */12 * * *` (00:00 y 12:00 UTC) y a mano desde *Actions → DB Backup →
+Run workflow*:
+
+1. **config** — comprueba los secrets al principio y falla con un mensaje
+   claro, no a mitad de la copia.
+2. **volcado** — por SSH ejecuta `scripts/mongo-backup.sh` en el servidor. El
+   script localiza el contenedor de MongoDB, hace `mongodump` dentro de él,
+   empaqueta el resultado en un `.tar.gz` con un `manifest.txt` y devuelve **una
+   única línea** por stdout: la ruta del tarball. Todo lo demás va a stderr, que
+   es lo que se ve en los logs.
+3. **subida** — copia el tarball al runner, verifica el `tar`, lo sube a R2 con
+   la CLI de AWS y confirma con `head-object` que el tamaño remoto es igual al
+   local: si no lo es, la copia está incompleta aunque `aws s3 cp` haya
+   devuelto 0.
+4. **retención** — borra las copias de más de `BACKUP_RETENTION_DAYS` días
+   (30 por defecto; `0` la desactiva).
+5. **limpieza** — borra el temporal del servidor y el `~/.aws` del runner,
+   pase lo que pase (`if: always()`).
+
+Ni la API ni MongoDB abren puertos: el workflow entra al servidor por SSH con
+las mismas credenciales que `cd.yml` y habla con el contenedor por el socket de
+Docker. La base sigue sin publicarse.
+
+#### Secrets y variables
+
+*Settings → Secrets and variables → Actions.*
+
+| Secret                | Obligatorio | Descripción                                          |
+|-----------------------|-------------|------------------------------------------------------|
+| `R2_ACCOUNT_ID`       | sí          | Account ID de Cloudflare (R2 → Details)              |
+| `R2_ACCESS_KEY_ID`    | sí          | ID de una API token de R2 con *Object Read & Write*  |
+| `R2_SECRET_ACCESS_KEY`| sí          | Secreto de esa API token                             |
+| `SERVER_HOST`         | sí          | IP del Droplet (el mismo que usa `cd.yml`)           |
+| `SERVER_SSH_KEY`      | sí          | Clave privada SSH (la misma que usa `cd.yml`)        |
+| `SERVER_HOST_KEY`     | no          | Host key del Droplet (si no, se usa `ssh-keyscan`)   |
+
+| Variable               | Por defecto  | Descripción                              |
+|------------------------|--------------|------------------------------------------|
+| `R2_BUCKET_NAME`       | `todos-backups` | Bucket de R2                           |
+| `R2_PREFIX`            | `backups/mongo` | Prefijo dentro del bucket              |
+| `BACKUP_RETENTION_DAYS`| `30`         | Días conservados (`0` = no prunar)        |
+| `MONGO_DATABASE`       | `todos`      | Base de datos copiada                     |
+| `SERVER_USER`          | `deploy`     | Usuario SSH en el servidor                |
+
+Para poner R2 en marcha:
+
+1. *R2 → Create bucket* (por ejemplo `todos-backups`), región automática.
+2. *My Profile → API Tokens → Create Token*, plantilla **Object Read & Write**
+   limitada al bucket. El `Account ID` está en *R2 → Details*.
+3. Copia el ID y el secreto de la token a los tres secrets de arriba.
+
+Cada copia acaba en
+`s3://todos-backups/backups/mongo/<base>-<timestamp>.tar.gz`, por ejemplo
+`backups/mongo/todos-20261006T000000Z.tar.gz`.
+
+### Restaurar (objetivo extendido)
+
+`scripts/mongo-restore.sh` descarga la copia más reciente de R2 (o la que le
+indiques) y la restaura en el contenedor:
+
+```bash
+# el script corre en el host donde esta el contenedor de MongoDB:
+#   scp scripts/mongo-restore.sh <servidor>:/tmp/
+export R2_ACCOUNT_ID=... R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=...
+
+./scripts/mongo-restore.sh --list        # que hay en R2
+./scripts/mongo-restore.sh --dry-run     # descarga y verifica, sin tocar datos
+./scripts/mongo-restore.sh               # restaura la mas reciente (pide confirmacion)
+./scripts/mongo-restore.sh <clave>       # una copia concreta
+
+# sin terminal interactiva hay que confirmar a mano:
+ssh <servidor> 'bash -s -- --yes' < scripts/mongo-restore.sh
+```
+
+La restauración usa `mongorestore --drop`: **sustituye** las colecciones
+existentes por las del backup. Por eso exige confirmación (`--yes` si no hay
+terminal) y por eso `--dry-run` —que solo descarga, comprueba el tar y enseña el
+`manifest.txt`— debería ser el primer paso siempre.
+
+Si no está instalada la CLI de AWS, el script usa la imagen `amazon/aws-cli` por
+Docker: en el servidor no hay que instalar nada.
+
+### Alternativa: cron en el servidor
+
+El mismo script sirve si prefieres no depender de GitHub. Un wrapper que vuelca
+y sube, y su línea de cron:
+
+```bash
+#!/usr/bin/env bash
+# /opt/scripts/backup.sh
+set -euo pipefail
+path="$(MONGO_DATABASE=todos /opt/scripts/mongo-backup.sh)"   # -> $HOME/backups
+aws s3 cp "$path" "s3://todos-backups/backups/mongo/$(basename "$path")" \
+  --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+```
+
+```cron
+# /etc/cron.d/mongo-backup (o el crontab del usuario): las variables van en
+# lineas propias, no como prefijo del comando
+R2_ACCOUNT_ID=...
+R2_ACCESS_KEY_ID=...
+R2_SECRET_ACCESS_KEY=...
+0 */12 * * * deploy /opt/scripts/backup.sh >> /var/log/mongo-backup.log 2>&1
+```
+
+### Decisiones de diseño
+
+- **El volcado ocurre en el servidor y la subida en el runner.** Las
+  credenciales de R2 solo existen en los secrets de GitHub: si el Droplet se
+  compromete, el atacante no puede borrar ni sobrescribir las copias.
+- **La contraseña de MongoDB no aparece en ningún `ps`.** El script viaja por
+  stdin a `bash -s` y la contraseña se escribe en el stdin de un `sh` dentro del
+  contenedor: solo `mongodump` la ve, y ahí dentro. En el servidor no se
+  escribe en ningún fichero.
+- **Tarball con manifiesto.** Cada copia lleva `manifest.txt` (fecha, base,
+  contenedor y versión de MongoDB), así que se sabe qué hay dentro sin fiarse
+  del nombre del fichero.
+- **Sin instalar nada.** La imagen oficial de MongoDB ya trae las Database Tools
+  (`mongodb-org-tools`, con `mongodump` y `mongorestore`), `mongosh` y `tar`.
+- **Verificación en los dos extremos:** `tar -tzf` antes de subir y
+  `head-object` después. Un backup que no se puede restaurar no es un backup.
+
+---
+
 ## Bonus — Reverse proxy con Nginx
 
 En producción solo Nginx publica puertos (`80` y `443`); la API y MongoDB se
@@ -349,6 +485,10 @@ Decisiones aplicadas en todo el proyecto:
   están en `.gitignore`; el `.env.production` del servidor va en `0600`.
 - **Credenciales efímeras.** El `config.json` de Docker Hub se borra del servidor
   al terminar cada despliegue.
+- **Copias fuera del servidor.** MongoDB se vuelca a Cloudflare R2 cada 12 horas
+  con 30 días de retención. La contraseña de la base no aparece en la línea de
+  comandos (viaja por stdin) y las credenciales de R2 solo existen en los
+  secrets de GitHub: el servidor no puede alterar las copias.
 - **Cloud Firewall + ufw:** dos capas. El tráfico solo entra por 22, 80 y 443.
 - **`X-Powered-By` desactivado** y `trust proxy` apagado por defecto: solo se
   activa con `TRUST_PROXY=true` en producción, que es cuando hay un nginx delante.

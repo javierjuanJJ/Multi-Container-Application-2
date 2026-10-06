@@ -1,0 +1,256 @@
+---
+# Copia automatica de MongoDB -> Cloudflare R2
+#
+#   schedule: cada 12 horas (00:00 y 12:00 UTC)
+#   workflow_dispatch: a mano desde Actions -> DB Backup -> Run workflow
+#
+# Pasos:
+#   1. por SSH ejecuta scripts/mongo-backup.sh en el servidor: mongodump dentro
+#      del contenedor de MongoDB -> un tarball en $HOME/backups.
+#   2. copia el tarball al runner, lo sube a Cloudflare R2 con la CLI de AWS y
+#      comprueba que el tamano en R2 coincide con el local.
+#   3. borra el temporal del servidor y aplica la retencion configurable.
+#
+# La contrasena de MongoDB no viaja por la linea de comandos: el script la lee
+# del entorno del propio contenedor y se la pasa a mongodump por stdin. Las
+# credenciales de R2 solo viven en los secrets de GitHub y en un fichero 0600
+# del runner, que se borra al terminar.
+#
+# Secrets (Settings -> Secrets and variables -> Actions):
+#   SERVER_HOST             IP publica del Droplet (el mismo que usa cd.yml)
+#   SERVER_SSH_KEY          clave privada SSH con acceso al Droplet
+#   R2_ACCOUNT_ID           Account ID de Cloudflare (R2 -> Details)
+#   R2_ACCESS_KEY_ID        ID de una API token de R2 con Object Read & Write
+#   R2_SECRET_ACCESS_KEY    secreto de esa API token
+# Opcionales:
+#   SERVER_HOST_KEY         host key del Droplet (si no, se usa ssh-keyscan)
+# Variables:
+#   SERVER_USER             usuario SSH (por defecto: deploy)
+#   MONGO_DATABASE          base de datos a copiar (por defecto: todos)
+#   R2_BUCKET_NAME          bucket de R2 (por defecto: todos-backups)
+#   R2_PREFIX               prefijo dentro del bucket (por defecto: backups/mongo)
+#   BACKUP_RETENTION_DAYS   dias de retencion (por defecto: 30, 0 = no prunar)
+name: DB Backup
+
+on:
+  schedule:
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: db-backup
+  # Nunca cancelar una copia a medias: dejaria un tarball incompleto en R2.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SERVER_USER: ${{ vars.SERVER_USER || 'deploy' }}
+  MONGO_DATABASE: ${{ vars.MONGO_DATABASE || 'todos' }}
+  R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME || 'todos-backups' }}
+  R2_PREFIX: ${{ vars.R2_PREFIX || 'backups/mongo' }}
+  BACKUP_RETENTION_DAYS: ${{ vars.BACKUP_RETENTION_DAYS || '30' }}
+  R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+
+jobs:
+  backup:
+    name: Dump MongoDB and upload to R2
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Comprobar la configuracion
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          # Fallar aqui y ahora con un mensaje claro es mejor que un error de
+          # aws cli (o peor: un endpoint mal formado) a mitad de la copia.
+          fallo=0
+          for nombre in SERVER_HOST R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY; do
+            if [ -z "${!nombre:-}" ]; then
+              echo "::error::Falta el secret ${nombre} (Settings -> Secrets and variables -> Actions)"
+              fallo=1
+            fi
+          done
+          exit "$fallo"
+
+      - name: Preparar la clave SSH del servidor
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/id_deploy_server
+          chmod 600 ~/.ssh/id_deploy_server
+
+      - name: Registrar la host key del servidor
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_HOST_KEY: ${{ secrets.SERVER_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          touch ~/.ssh/known_hosts
+          if [ -n "${SERVER_HOST_KEY:-}" ]; then
+            printf '%s\n' "$SERVER_HOST_KEY" >> ~/.ssh/known_hosts
+          else
+            # ssh-keyscan no autentica nada: guarda la huella real en
+            # SERVER_HOST_KEY para una copia segura.
+            ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+          fi
+
+      - name: Volcar la base de datos en el servidor
+        id: dump
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          set -euo pipefail
+          # ssh no reenvia el entorno local: la variable viaja como prefijo del
+          # comando remoto (escapada con %q) y el script imprime en stdout unica
+          # y exclusivamente la ruta del tarball. Todo lo demas va a stderr.
+          remote_cmd="$(printf 'MONGO_DATABASE=%q bash -s' "$MONGO_DATABASE")"
+          remote_path="$(
+            ssh -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes \
+              -o ConnectTimeout=15 \
+              "${SERVER_USER}@${SERVER_HOST}" \
+              "$remote_cmd" < scripts/mongo-backup.sh
+          )"
+          case "$remote_path" in
+            '' | *$'\n'*)
+              echo "::error::el script de backup no devolvio una ruta valida"
+              exit 1
+              ;;
+          esac
+          echo "path=${remote_path}" >> "$GITHUB_OUTPUT"
+
+      - name: Copiar el tarball al runner
+        id: fetch
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          REMOTE_PATH: ${{ steps.dump.outputs.path }}
+        run: |
+          set -euo pipefail
+          file="$(basename "$REMOTE_PATH")"
+          scp -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes \
+            "${SERVER_USER}@${SERVER_HOST}:${REMOTE_PATH}" \
+            "${RUNNER_TEMP}/${file}"
+          echo "file=${RUNNER_TEMP}/${file}" >> "$GITHUB_OUTPUT"
+
+      - name: Borrar el temporal del servidor
+        if: always() && steps.dump.outputs.path != ''
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          REMOTE_PATH: ${{ steps.dump.outputs.path }}
+        run: |
+          set -euo pipefail
+          remote_cmd="$(printf 'rm -f -- %q' "$REMOTE_PATH")"
+          ssh -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes \
+            "${SERVER_USER}@${SERVER_HOST}" "$remote_cmd" || true
+
+      - name: Verificar el tarball
+        env:
+          BACKUP_FILE: ${{ steps.fetch.outputs.file }}
+        run: |
+          set -euo pipefail
+          test -s "$BACKUP_FILE" || { echo "::error::tarball vacio"; exit 1; }
+          tar -tzf "$BACKUP_FILE" > /dev/null
+          echo "sha256=$(sha256sum "$BACKUP_FILE" | cut -d' ' -f1)"
+          echo "size=$(stat -c %s "$BACKUP_FILE") bytes"
+
+      - name: Configurar la CLI de AWS para Cloudflare R2
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          # Solo vivira en el runner: el paso de limpieza lo borra siempre.
+          install -d -m 700 ~/.aws
+          umask 077
+          cat > ~/.aws/credentials <<EOF
+          [default]
+          aws_access_key_id = ${R2_ACCESS_KEY_ID}
+          aws_secret_access_key = ${R2_SECRET_ACCESS_KEY}
+          EOF
+          cat > ~/.aws/config <<EOF
+          [default]
+          region = auto
+          output = json
+          EOF
+          chmod 600 ~/.aws/credentials ~/.aws/config
+
+      - name: Subir la copia a Cloudflare R2
+        id: upload
+        env:
+          BACKUP_FILE: ${{ steps.fetch.outputs.file }}
+        run: |
+          set -euo pipefail
+          key="${R2_PREFIX:+${R2_PREFIX%/}/}$(basename "$BACKUP_FILE")"
+
+          aws s3 cp "$BACKUP_FILE" "s3://${R2_BUCKET_NAME}/${key}" \
+            --endpoint-url "$R2_ENDPOINT"
+
+          # R2 responde con el tamano registrado: si no coincide con el local,
+          # la subida esta incompleta aunque el comando haya devuelto 0.
+          remote_size="$(aws s3api head-object \
+            --bucket "$R2_BUCKET_NAME" --key "$key" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --query ContentLength --output text)"
+          local_size="$(stat -c %s "$BACKUP_FILE")"
+          if [ "$remote_size" != "$local_size" ]; then
+            echo "::error::tamano distinto: local=${local_size} r2=${remote_size}"
+            exit 1
+          fi
+
+          echo "Subida: s3://${R2_BUCKET_NAME}/${key} (${local_size} bytes)"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+
+      - name: Aplicar la retencion
+        env:
+          UPLOADED_KEY: ${{ steps.upload.outputs.key }}
+        run: |
+          set -euo pipefail
+          case "$BACKUP_RETENTION_DAYS" in
+            '' | *[!0-9]*)
+              echo "::error::BACKUP_RETENTION_DAYS debe ser un numero, no '${BACKUP_RETENTION_DAYS}'"
+              exit 1
+              ;;
+          esac
+          if [ "$BACKUP_RETENTION_DAYS" -eq 0 ]; then
+            echo "Retencion desactivada (BACKUP_RETENTION_DAYS=0)"
+            exit 0
+          fi
+
+          cutoff=$(( $(date -u +%s) - BACKUP_RETENTION_DAYS * 86400 ))
+          prefix="${R2_PREFIX:+${R2_PREFIX%/}/}"
+          objects="$(aws s3api list-objects-v2 \
+            --bucket "$R2_BUCKET_NAME" --prefix "$prefix" \
+            --query 'Contents[].[Key,LastModified]' --output text \
+            --endpoint-url "$R2_ENDPOINT")"
+
+          deleted=0
+          while IFS=$'\t' read -r key modified; do
+            [ -n "${key:-}" ] || continue
+            epoch="$(date -u -d "$modified" +%s 2>/dev/null || true)"
+            [ -n "$epoch" ] || continue
+            [ "$epoch" -ge "$cutoff" ] && continue
+
+            aws s3api delete-object \
+              --bucket "$R2_BUCKET_NAME" --key "$key" \
+              --endpoint-url "$R2_ENDPOINT" > /dev/null
+            echo "Borrada por retencion (${BACKUP_RETENTION_DAYS} dias): ${key}"
+            deleted=$(( deleted + 1 ))
+          done <<< "$objects"
+
+          echo "Copias borradas: ${deleted}"
+          echo "Copia actual conservada: ${UPLOADED_KEY}"
+
+      - name: Limpiar los ficheros temporales del runner
+        if: always()
+        run: rm -rf ~/.aws "${RUNNER_TEMP}"/*.tar.gz
