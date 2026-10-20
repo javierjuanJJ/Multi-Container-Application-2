@@ -1,0 +1,58 @@
+# Alertas del despliegue blue-green.
+#
+# No hay Alertmanager configurado: las alertas se ven en
+# http://<servidor>:9090/alerts y se pueden enrutar despues con un
+# Alertmanager (correo, Slack, webhooks...).
+#
+# Nota sobre SlotDown: en un despliegue blue-green el color que NO sirve puede
+# estar parado a proposit (blue-green.sh retire). Por eso es warning y con un
+# `for` largo; la alerta que de verdad importa es ActiveColorDown, que mide el
+# trafico real a traves del proxy.
+
+groups:
+  - name: blue-green
+    interval: 30s
+    rules:
+      - alert: ProxyDown
+        expr: probe_success{job="blackbox-http", instance="http://nginx/nginx-health"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Nginx no responde"
+          description: "El reverse proxy no contesta en /nginx-health: no entra trafico en absoluto."
+
+      - alert: ActiveColorDown
+        expr: probe_success{job="blackbox-http", instance="http://nginx/health"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "El color activo no responde a traves del proxy"
+          description: "GET http://nginx/health falla: el color que recibe trafico esta caido. Rollback inmediato: ./scripts/blue-green.sh rollback"
+
+      - alert: SlotDown
+        expr: probe_success{job="blackbox-http", instance=~"http://api-(blue|green):3000/health"} == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slot {{ $labels.instance }} sin responder"
+          description: "Habitual si es el color retirado tras un despliegue. Si es el color activo, mira tambien ActiveColorDown."
+
+      - alert: SlotRestarted
+        expr: changes(container_start_time_seconds{name=~".*api-(blue|green).*"}[10m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "El slot {{ $labels.name }} se ha reiniciado"
+          description: "Normal durante un despliegue; si no ha habido despliegue, revisa los logs: puede ser un crash-loop."
+
+      - alert: MonitoringDown
+        expr: up{job=~"prometheus|cadvisor"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "El sistema de monitoreo esta a ciegas"
+          description: "Prometheus no puede scrapear {{ $labels.job }}: no confies en la ausencia de alertas."

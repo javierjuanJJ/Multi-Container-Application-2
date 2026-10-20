@@ -1,10 +1,13 @@
 ---
-# Requisito #3 (parte 2) - CD: publica la imagen y despliega el stack con Docker Compose.
+# Requisito #3 (parte 2) + sesion Blue-Green Deployment
 #
 #   1. build   -> construye la imagen y la sube a Docker Hub (etiquetas `latest` y `sha-<corto>`)
 #   2. deploy  -> se conecta al Droplet por SSH, sube los ficheros de compose, nginx y el
-#                 .env.production, y ejecuta `docker compose pull && up -d --wait`
-#   3. smoke   -> comprueba el CRUD contra el servidor ya desplegado
+#                 .env.production, y ejecuta `blue-green.sh deploy <imagen>`:
+#                 la imagen nueva arranca en el color INACTIVO, se espera a su
+#                 healthcheck y solo entonces se conmuta el trafico con
+#                 `nginx -s reload`. Si algo falla, el trafico no se mueve.
+#   3. smoke   -> comprueba el CRUD contra el servidor ya desplegado (el color nuevo)
 #
 # El despliegue usa solo ssh/rsync nativos del runner (sin acciones de terceros).
 # Ninguna credencial viaja en la linea de comandos: viajan por stdin o por fichero.
@@ -29,6 +32,7 @@ on:
       - "api/**"
       - "docker-compose.prod.yml"
       - "nginx/**"
+      - "scripts/**"
       - ".github/workflows/cd.yml"
   workflow_dispatch:
     inputs:
@@ -36,6 +40,11 @@ on:
         description: "Etiqueta a desplegar (vacio = la del commit actual)"
         required: false
         default: ""
+      rollback:
+        description: "Rollback: devuelve el trafico al color anterior en vez de desplegar"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: cd-production
@@ -113,7 +122,7 @@ jobs:
         run: docker manifest inspect "${{ steps.tag.outputs.value }}" > /dev/null
 
   deploy:
-    name: Deploy with docker compose
+    name: Deploy with blue-green
     needs: build
     runs-on: ubuntu-latest
     environment: production
@@ -167,6 +176,10 @@ jobs:
           set -euo pipefail
           install -d -m 700 .staging
           umask 077
+          # API_IMAGE es la ultima imagen publicada. Las claves por color
+          # (API_IMAGE_BLUE / API_IMAGE_GREEN) las gestiona blue-green.sh en el
+          # servidor: cada despliegue solo cambia la del color inactivo, y el
+          # activo se queda con la que ya estaba corriendo.
           cat > .staging/.env.production <<EOF
           API_IMAGE=${API_IMAGE}
           MONGO_ROOT_USERNAME=${MONGO_ROOT_USERNAME}
@@ -194,6 +207,13 @@ jobs:
           rsync -az -e "ssh -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes" \
             ./nginx/conf.d/default.conf "$remote:${DEPLOY_PATH}/nginx/conf.d/default.conf"
 
+          # El script que decide el color activo. OJO: nginx/upstream/active.conf
+          # NO se sincroniza: es el estado del despliegue en el servidor y
+          # subirlo romperia el color que ahora mismo recibe trafico. El propio
+          # script lo crea si no existe.
+          rsync -az --chmod=ugo+rX -e "ssh -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes" \
+            ./scripts/blue-green.sh "$remote:${DEPLOY_PATH}/blue-green.sh"
+
           # Contiene credenciales: el script remoto lo deja en 0600.
           rsync -az -e "ssh -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes" \
             .staging/.env.production "$remote:${DEPLOY_PATH}/.env.production"
@@ -204,18 +224,20 @@ jobs:
             "${RUNNER_TEMP}/docker-config/config.json" \
             "$remote:${DEPLOY_PATH}/.docker-config.json"
 
-      - name: Desplegar el stack con Docker Compose
+      - name: Desplegar con blue-green
+        if: ${{ inputs.rollback != true }}
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          API_IMAGE: ${{ needs.build.outputs.deploy_image }}
         run: |
           set -euo pipefail
 
           # El script viaja por stdin, pero ssh NO reenvia el entorno local: por eso
-          # las dos variables no secretas se pasan como prefijo del comando remoto.
+          # las variables no secretas se pasan como prefijo del comando remoto.
           # El resto de credenciales ya viajan en ficheros o por stdin.
           ssh -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes \
             "${SERVER_USER}@${SERVER_HOST}" \
-            "DEPLOY_PATH='${DEPLOY_PATH}' COMPOSE_FILE='${COMPOSE_FILE}' bash -s" <<'REMOTE'
+            "API_IMAGE='${API_IMAGE}' DEPLOY_PATH='${DEPLOY_PATH}' COMPOSE_FILE='${COMPOSE_FILE}' WAIT_TIMEOUT=240 bash -s" <<'REMOTE'
           set -euo pipefail
 
           deploy_path="${DEPLOY_PATH}"
@@ -231,20 +253,36 @@ jobs:
           install -m 600 "${deploy_path}/.docker-config.json" "${HOME}/.docker/config.json"
           rm -f "${deploy_path}/.docker-config.json"
 
-          # `config` valida el YAML y la interpolacion de variables antes de tocar nada.
-          docker compose --env-file .env.production -f "$compose_file" config --quiet
+          # COMPOSE_FILE solo hace falta para que el script localice el stack.
+          export COMPOSE_FILE="${compose_file}"
 
-          docker compose --env-file .env.production -f "$compose_file" pull
-
-          # --remove-orphans retira contenedores de despliegues anteriores.
-          # --wait devuelve error si algun servicio no llega a healthy.
-          docker compose --env-file .env.production -f "$compose_file" \
-            up -d --remove-orphans --wait --wait-timeout 180
-
-          docker compose --env-file .env.production -f "$compose_file" ps
+          # El corazon del blue-green: la imagen nueva arranca en el color
+          # inactivo, se espera a que este healthy, se verifica por la red de
+          # nginx y SOLO DESPUES se conmuta el trafico. Si algo falla antes de
+          # la conmutacion el trafico sigue en el color que ya servia, y el
+          # script sale con error y revienta el workflow.
+          ./blue-green.sh deploy "${API_IMAGE}"
 
           # No dejar la sesion de Docker Hub abierta en un servidor compartido.
           rm -f "${HOME}/.docker/config.json"
+          REMOTE
+
+      - name: Revertir al color anterior (rollback)
+        if: ${{ inputs.rollback == true }}
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          set -euo pipefail
+
+          # Sin credenciales de Docker Hub: el color anterior ya esta en el host
+          # y con su imagen. Solo hay que recargar el upstream y verificar.
+          ssh -i ~/.ssh/id_deploy_server -o IdentitiesOnly=yes \
+            "${SERVER_USER}@${SERVER_HOST}" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' COMPOSE_FILE='${COMPOSE_FILE}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "${DEPLOY_PATH}"
+          export COMPOSE_FILE
+          ./blue-green.sh rollback
           REMOTE
 
       - name: Limpiar los ficheros temporales del runner
@@ -252,7 +290,7 @@ jobs:
         run: rm -rf .staging "${RUNNER_TEMP}/docker-config"
 
   smoke-test:
-    name: Verify the deployed stack
+    name: Verify the new color
     needs: deploy
     runs-on: ubuntu-latest
     environment: production

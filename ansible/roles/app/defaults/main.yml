@@ -15,6 +15,17 @@ app_project_root: "{{ playbook_dir | dirname }}"
 app_compose_file_src: "{{ app_project_root }}/docker-compose.prod.yml"
 app_compose_file_name: docker-compose.prod.yml
 app_nginx_conf_src: "{{ app_project_root }}/nginx/conf.d/default.conf"
+app_deploy_script_src: "{{ app_project_root }}/scripts/blue-green.sh"
+
+# Despliegue blue-green: la imagen nueva se tira en el color inactivo y el
+# trafico solo cambia despues del healthcheck. Cambia `app_stop_previous` a
+# true si prefieres parar el color anterior en cuanto conmuta (ahorra RAM y
+# elimina el rollback inmediato).
+app_stop_previous: false
+app_wait_timeout: "240"
+app_deploy_command: >-
+  {{ app_dir }}/blue-green.sh deploy {{ app_image }}
+  {{ '--stop-previous' if app_stop_previous else '' }}
 
 # Variables de la imagen publicada por el pipeline
 app_image: ""

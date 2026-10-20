@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------------------
+# Monitoreo del stack (bonus) - se levanta aparte del despliegue:
+#
+#   docker compose -f docker-compose.monitoring.yml up -d --wait
+#
+# Prometheus scrapea su propio proceso, cadvisor (metricas de contenedores) y
+# un blackbox-exporter que hace sondas HTTP contra las piezas del
+# despliegue blue-green:
+#
+#   http://nginx/nginx-health   -> el reverse proxy (camino de todos los clientes)
+#   http://nginx/health         -> el color ACTIVO, a traves del proxy
+#   http://api-blue:3000/health -> el slot azul directamente
+#   http://api-green:3000/health-> el slot verde directamente
+#
+# Interfaz: http://<servidor>:9090  (/alerts muestra las alertas disparadas)
+#
+# Los contenedores de la API y de nginx viven en la red externa
+# `todos-prod_frontend`, la que crea docker-compose.prod.yml. Si renombras el
+# proyecto de compose de produccion, cambia tambien `networks.frontend.name`.
+# ---------------------------------------------------------------------------
+
+name: todos-monitoring
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # Permite recargar la configuracion sin reiniciar:  curl -X POST :9090/-/reload
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - frontend
+
+  # Sondas HTTP programadas por Prometheus. No publica puertos: solo Prometheus
+  # dentro de la red habla con el.
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    networks:
+      - frontend
+
+  # Metricas de contenedores (CPU, memoria, reinicios). Un reinicio inesperado
+  # de un slot es la senal classica de un despliegue o de un crash-loop.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    restart: unless-stopped
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+    networks:
+      - frontend
+
+volumes:
+  prometheus-data:
+    name: todos-prometheus-data
+
+networks:
+  # Red que ya usa el stack de produccion: nginx y los dos slots cuelgan de ella.
+  frontend:
+    name: todos-prod_frontend
+    external: true

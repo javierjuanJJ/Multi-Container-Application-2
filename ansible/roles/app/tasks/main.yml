@@ -1,10 +1,16 @@
 ---
 # ---------------------------------------------------------------------------
-# Requisito #2 y #3 - Desplegar el stack con Docker Compose en el Droplet
+# Requisito #2 y #3 + sesion Blue-Green - Despliegue en el Droplet
 #
-# Copia los ficheros de compose + la config de nginx al servidor, tira la imagen
-# publicada en Docker Hub y levanta el stack. MongoDB nunca se reinicia con
-# `up -d`, asi que los datos del volumen sobreviven a cada despliegue.
+# Copia al servidor el compose, la config de nginx y el script blue-green.sh,
+# y luego deja que el propio script despliegue: la imagen nueva arranca en el
+# color inactivo, espera a su healthcheck y solo despues conmuta el trafico
+# con `nginx -s reload`. MongoDB es unico y compartido por los dos colores,
+# asi que los datos del volumen sobreviven a cada despliegue.
+#
+# OJO: nginx/upstream/active.conf NO se copia: es el estado del despliegue en
+# el servidor (que color recibe trafico) y subirlo romperia el color activo.
+# El propio script lo crea si no existe.
 # ---------------------------------------------------------------------------
 
 - name: Validar que la imagen de la API esta definida
@@ -52,6 +58,16 @@
     mode: "0644"
   register: app_nginx_conf
 
+# El motor del despliegue blue-green: decide el color, espera al healthcheck
+# del slot nuevo y conmuta el trafico con `nginx -s reload`.
+- name: Copiar el script de despliegue blue-green
+  ansible.builtin.copy:
+    src: "{{ app_deploy_script_src }}"
+    dest: "{{ app_dir }}/blue-green.sh"
+    owner: "{{ app_user }}"
+    group: "{{ app_group }}"
+    mode: "0755"
+
 - name: Generar el fichero de variables de entorno
   ansible.builtin.template:
     src: env.production.j2
@@ -62,22 +78,20 @@
   no_log: true
   register: app_env
 
-# Fallar aqui si el YAML es invalido es mucho mejor que fallar en `up -d`.
+# El script crea nginx/upstream/active.conf si falta, completa las claves por
+# color (API_IMAGE_BLUE/GREEN) a partir de lo que ya esta corriendo y solo
+# despues valida con `docker compose config`. Fallar aqui es mucho mejor que
+# fallar a mitad de una conmutacion.
 - name: Validar la configuracion de compose
   ansible.builtin.command:
-    argv:
-      - docker
-      - compose
-      - --env-file
-      - "{{ app_env_file }}"
-      - -f
-      - "{{ app_compose_file_name }}"
-      - config
-      - --quiet
+    argv: ["{{ app_dir }}/blue-green.sh", "validate"]
   args:
     chdir: "{{ app_dir }}"
   become_user: "{{ app_user }}"
   changed_when: false
+  environment:
+    COMPOSE_FILE: "{{ app_compose_file_name }}"
+    ENV_FILE: "{{ app_env_file }}"
 
 - name: Autenticarse en el registro de imagenes
   ansible.builtin.command:
@@ -92,60 +106,34 @@
     - app_registry_username | length > 0
     - app_registry_password | length > 0
 
-- name: Descargar las imagenes del stack
+# Despliegue blue-green: la imagen nueva arranca en el color INACTIVO, se
+# espera a su healthcheck, se verifica desde la red de nginx y SOLO DESPUES
+# se conmuta el trafico. El color activo no se toca mientras tanto, y si algo
+# falla antes de la conmutacion el trafico no se mueve.
+- name: Desplegar con blue-green
   ansible.builtin.command:
-    argv:
-      - docker
-      - compose
-      - --env-file
-      - "{{ app_env_file }}"
-      - -f
-      - "{{ app_compose_file_name }}"
-      - pull
-  args:
-    chdir: "{{ app_dir }}"
-  become_user: "{{ app_user }}"
-  register: app_pull
-  changed_when: "'Downloading' in app_pull.stdout or 'Pulled' in app_pull.stdout"
-
-# --remove-orphans limpia contenedores de despliegues anteriores.
-# Sin -d se espera al healthcheck de mongo y de la API antes de dar el paso por bueno.
-- name: Levantar o actualizar el stack
-  ansible.builtin.command:
-    argv:
-      - docker
-      - compose
-      - --env-file
-      - "{{ app_env_file }}"
-      - -f
-      - "{{ app_compose_file_name }}"
-      - up
-      - -d
-      - --remove-orphans
-      - --wait
-      - --wait-timeout
-      - "120"
+    argv: "{{ app_deploy_command }}"
   args:
     chdir: "{{ app_dir }}"
   become_user: "{{ app_user }}"
   register: app_up
   changed_when: true
+  environment:
+    COMPOSE_FILE: "{{ app_compose_file_name }}"
+    ENV_FILE: "{{ app_env_file }}"
+    WAIT_TIMEOUT: "{{ app_wait_timeout }}"
 
-- name: Mostrar el estado del stack
+- name: Mostrar el estado del despliegue
   ansible.builtin.command:
-    argv:
-      - docker
-      - compose
-      - --env-file
-      - "{{ app_env_file }}"
-      - -f
-      - "{{ app_compose_file_name }}"
-      - ps
+    argv: ["{{ app_dir }}/blue-green.sh", "status"]
   args:
     chdir: "{{ app_dir }}"
   become_user: "{{ app_user }}"
   changed_when: false
   register: app_ps
+  environment:
+    COMPOSE_FILE: "{{ app_compose_file_name }}"
+    ENV_FILE: "{{ app_env_file }}"
 
 - name: Estado de los contenedores
   ansible.builtin.debug:
@@ -164,6 +152,6 @@
 - name: Resultado del despliegue
   ansible.builtin.debug:
     msg: >-
-      Stack desplegado con {{ app_image }} en
+      Despliegue blue-green terminado con {{ app_image }} en
       http://{{ app_healthcheck_host }}:{{ app_http_port }}
       (healthcheck: {{ app_healthcheck.json.status }})

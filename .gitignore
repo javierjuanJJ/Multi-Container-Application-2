@@ -24,6 +24,11 @@ api/.npm/
 !.env.example
 !.env.production.example
 
+# Estado del despliegue blue-green (vive en el servidor, no en git)
+.blue-green-state
+nginx/upstream/*.bak
+nginx/upstream/*.tmp
+
 # Ficheros temporales del pipeline de despliegue
 .staging/
 
